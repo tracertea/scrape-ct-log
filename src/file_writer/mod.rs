@@ -9,6 +9,7 @@ use gen_server::{GenServer, Status::Continue};
 use url::Url;
 
 use std::collections::HashMap;
+use std::fs;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::marker::PhantomData;
@@ -119,6 +120,12 @@ struct Metadata<'a> {
 	sth: &'a GetSthResponse,
 }
 
+struct ChunkWriter<'a> {
+	writer: BufWriter<Box<dyn Write + Send + Sync + 'a>>,
+	count: u64,
+	path: PathBuf,
+}
+
 enum State<'a> {
 	Jsonl {
 		log_url: Url,
@@ -127,7 +134,7 @@ enum State<'a> {
 		metadata_path: Option<PathBuf>,
 		output_path: Option<PathBuf>,
 		split_by: Option<u64>,
-		writers: HashMap<u64, BufWriter<Box<dyn Write + Send + Sync + 'a>>>,
+		writers: HashMap<u64, ChunkWriter<'a>>,
 		include_chains: bool,
 		include_precert_data: bool,
 	},
@@ -161,8 +168,7 @@ impl<'a> GenServer for FileWriter<'a> {
 	fn init(args: Args) -> Result<Self, Self::Error> {
 		let state = match args.format {
 			OutputFormat::JSONL => {
-				let mut writers: HashMap<u64, BufWriter<Box<dyn Write + Send + Sync + 'a>>> =
-					HashMap::new();
+				let mut writers: HashMap<u64, ChunkWriter<'a>> = HashMap::new();
 				let metadata_path: Option<PathBuf>;
 				let output_path: Option<PathBuf>;
 
@@ -177,11 +183,25 @@ impl<'a> GenServer for FileWriter<'a> {
 							File::create(&p)
 								.map_err(|e| Error::system("failed to create output file", e))?,
 						);
-						writers.insert(0, BufWriter::new(file));
+						writers.insert(
+							0,
+							ChunkWriter {
+								writer: BufWriter::new(file),
+								count: 0,
+								path: p,
+							},
+						);
 					}
 				} else {
 					let stdout: Box<dyn Write + Send + Sync + 'a> = Box::new(io::stdout());
-					writers.insert(0, BufWriter::new(stdout));
+					writers.insert(
+						0,
+						ChunkWriter {
+							writer: BufWriter::new(stdout),
+							count: 0,
+							path: PathBuf::new(), // Not used for stdout
+						},
+					);
 					metadata_path = None;
 					output_path = None;
 				}
@@ -260,34 +280,32 @@ impl<'a> GenServer for FileWriter<'a> {
 						0
 					};
 
-					if !writers.contains_key(&chunk_key) {
+					let chunk_writer = if let Some(writer) = writers.get_mut(&chunk_key) {
+						writer
+					} else {
 						let p = output_path.as_ref().ok_or_else(|| {
 							Error::internal("split_by is set but output_path is not")
 						})?;
 
-						let stem = p
-							.file_stem()
-							.and_then(std::ffi::OsStr::to_str)
-							.unwrap_or_default();
-						let ext = p
-							.extension()
-							.and_then(std::ffi::OsStr::to_str)
-							.unwrap_or("jsonl");
-
-						let new_filename = format!("{stem}.{chunk_key}.{ext}");
-						let new_path = p.with_file_name(new_filename);
+						// Create a temporary filename, which we will rename later when we know the final count
+						let temp_filename = format!("{}.{}.jsonl.tmp", p.display(), chunk_key);
+						let temp_path = p.with_file_name(temp_filename);
 
 						let file: Box<dyn Write + Send + Sync> = Box::new(
-							File::create(new_path)
+							File::create(&temp_path)
 								.map_err(|e| Error::system("failed to create chunk file", e))?,
 						);
 
-						writers.insert(chunk_key, BufWriter::new(file));
-					}
-
-					let current_writer = writers
-						.get_mut(&chunk_key)
-						.ok_or_else(|| Error::internal("writer is not available for entry chunk"))?;
+						writers.insert(
+							chunk_key,
+							ChunkWriter {
+								writer: BufWriter::new(file),
+								count: 0,
+								path: temp_path,
+							},
+						);
+						writers.get_mut(&chunk_key).unwrap() // Should exist now
+					};
 
 					let (timestamp, certificate, chain_certs, precert) =
 						if let TreeLeafEntry::TimestampedEntry(ts_entry) = &entry.leaf_input.entry {
@@ -349,11 +367,13 @@ impl<'a> GenServer for FileWriter<'a> {
 						precertificate,
 					};
 
-					serde_json::to_writer(&mut *current_writer, &jsonl_entry)
+					serde_json::to_writer(&mut chunk_writer.writer, &jsonl_entry)
 						.map_err(|e| Error::output("jsonl entry", e))?;
-					current_writer
+					chunk_writer
+						.writer
 						.write_all(b"\n")
 						.map_err(|e| Error::output("jsonl newline", e))?;
+					chunk_writer.count += 1;
 
 					Ok(Continue)
 				}
@@ -524,10 +544,38 @@ impl<'a> GenServer for FileWriter<'a> {
 				scrape_begin_timestamp,
 				metadata_path,
 				writers,
+				output_path,
 				..
 			} => {
-				for (_, mut writer) in writers.drain() {
-					drop(writer.flush());
+				for (chunk_key, mut chunk_writer) in writers.drain() {
+					if let Err(e) = chunk_writer.writer.flush() {
+						log::warn!("Failed to flush writer for chunk {}: {}", chunk_key, e);
+					}
+
+					// If we are splitting files, rename the temp file to its final name
+					if let Some(base_path) = output_path {
+						let stem = base_path
+							.file_stem()
+							.and_then(std::ffi::OsStr::to_str)
+							.unwrap_or_default();
+						let ext = base_path
+							.extension()
+							.and_then(std::ffi::OsStr::to_str)
+							.unwrap_or("jsonl");
+
+						let final_filename =
+							format!("{stem}.{chunk_key}.{}.{ext}", chunk_writer.count);
+						let final_path = base_path.with_file_name(final_filename);
+
+						if let Err(e) = fs::rename(&chunk_writer.path, &final_path) {
+							log::warn!(
+								"Failed to rename chunk file from {} to {}: {}",
+								chunk_writer.path.display(),
+								final_path.display(),
+								e
+							);
+						}
+					}
 				}
 
 				if let (Some(path), Some(sth_val)) = (metadata_path, sth.as_ref()) {
