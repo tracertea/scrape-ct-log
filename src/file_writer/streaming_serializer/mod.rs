@@ -5,12 +5,12 @@ use std::{
 	sync::{Arc, RwLock},
 };
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[doc(hidden)]
 #[non_exhaustive]
 pub enum StreamFormat {
 	#[default]
-	JSON,
+	JSONL,
 	#[cfg(feature = "cbor")]
 	CBOR,
 }
@@ -18,7 +18,7 @@ pub enum StreamFormat {
 impl std::fmt::Display for StreamFormat {
 	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
 		match self {
-			StreamFormat::JSON => formatter.write_str("json"),
+			StreamFormat::JSONL => formatter.write_str("jsonl"),
 			#[cfg(feature = "cbor")]
 			StreamFormat::CBOR => formatter.write_str("cbor"),
 		}
@@ -37,7 +37,7 @@ impl TryFrom<&str> for StreamFormat {
 
 	fn try_from(s: &str) -> Result<Self, Self::Error> {
 		match s {
-			"json" => Ok(Self::JSON),
+			"jsonl" | "json" => Ok(Self::JSONL),
 			#[cfg(feature = "cbor")]
 			"cbor" => Ok(Self::CBOR),
 			_ => Err(format!("unknown output format {s:?}")),
@@ -68,7 +68,7 @@ impl<'a> StreamingSerializer<'a> {
 
 	pub(crate) fn string(&self, s: &str) -> io::Result<()> {
 		self.write(&match self.format {
-			StreamFormat::JSON => json!(s).to_string().into_bytes(),
+			StreamFormat::JSONL => json!(s).to_string().into_bytes(),
 			#[cfg(feature = "cbor")]
 			StreamFormat::CBOR => cbor(|mut enc| enc.text(s, None))?,
 		})
@@ -76,7 +76,7 @@ impl<'a> StreamingSerializer<'a> {
 
 	pub(crate) fn bytes(&self, b: &[u8]) -> io::Result<()> {
 		self.write(&match self.format {
-			StreamFormat::JSON => json!(b64.encode(b)).to_string().into_bytes(),
+			StreamFormat::JSONL => json!(b64.encode(b)).to_string().into_bytes(),
 			#[cfg(feature = "cbor")]
 			StreamFormat::CBOR => cbor(|mut enc| enc.bytes(b, None))?,
 		})
@@ -84,7 +84,7 @@ impl<'a> StreamingSerializer<'a> {
 
 	pub(crate) fn uint(&self, u: u64) -> io::Result<()> {
 		self.write(&match self.format {
-			StreamFormat::JSON => json!(u).to_string().into_bytes(),
+			StreamFormat::JSONL => json!(u).to_string().into_bytes(),
 			#[cfg(feature = "cbor")]
 			StreamFormat::CBOR => cbor(|mut enc| enc.push(CBORHeader::Positive(u)))?,
 		})
@@ -92,7 +92,7 @@ impl<'a> StreamingSerializer<'a> {
 
 	pub(crate) fn map(&self) -> io::Result<StreamingMap<'a>> {
 		self.write(&match self.format {
-			StreamFormat::JSON => b"{".to_vec(),
+			StreamFormat::JSONL => b"{".to_vec(),
 			#[cfg(feature = "cbor")]
 			StreamFormat::CBOR => cbor(|mut enc| enc.push(CBORHeader::Map(None)))?,
 		})?;
@@ -108,7 +108,7 @@ impl<'a> StreamingSerializer<'a> {
 
 	pub(crate) fn seq(&self) -> io::Result<StreamingSeq<'a>> {
 		self.write(&match self.format {
-			StreamFormat::JSON => b"[".to_vec(),
+			StreamFormat::JSONL => b"[".to_vec(),
 			#[cfg(feature = "cbor")]
 			StreamFormat::CBOR => cbor(|mut enc| enc.push(CBORHeader::Array(None)))?,
 		})?;
@@ -134,7 +134,7 @@ impl<'a> StreamingMap<'a> {
 	pub(crate) fn key(&mut self, key: &str) -> io::Result<()> {
 		self.element()?;
 		match self.format {
-			StreamFormat::JSON => {
+			StreamFormat::JSONL => {
 				self.s.string(key)?;
 				self.s.write(b":")
 			}
@@ -145,7 +145,7 @@ impl<'a> StreamingMap<'a> {
 
 	pub(crate) fn end(&self) -> io::Result<()> {
 		self.s.write(&match self.format {
-			StreamFormat::JSON => b"}".to_vec(),
+			StreamFormat::JSONL => b"}".to_vec(),
 			#[cfg(feature = "cbor")]
 			StreamFormat::CBOR => cbor(|mut enc| enc.push(CBORHeader::Break))?,
 		})
@@ -174,7 +174,7 @@ impl<'a> StreamingMap<'a> {
 	fn element(&mut self) -> io::Result<()> {
 		if self.element_written {
 			match self.format {
-				StreamFormat::JSON => self.s.write(b","),
+				StreamFormat::JSONL => self.s.write(b","),
 				#[cfg(feature = "cbor")]
 				StreamFormat::CBOR => Ok::<(), io::Error>(()),
 			}?;
@@ -194,7 +194,7 @@ pub(crate) struct StreamingSeq<'a> {
 impl<'a> StreamingSeq<'a> {
 	pub(crate) fn end(&self) -> io::Result<()> {
 		self.s.write(&match self.format {
-			StreamFormat::JSON => b"]".to_vec(),
+			StreamFormat::JSONL => b"]".to_vec(),
 			#[cfg(feature = "cbor")]
 			StreamFormat::CBOR => cbor(|mut enc| enc.push(CBORHeader::Break))?,
 		})
@@ -231,7 +231,7 @@ impl<'a> StreamingSeq<'a> {
 	fn element(&mut self) -> io::Result<()> {
 		if self.element_written {
 			match self.format {
-				StreamFormat::JSON => self.s.write(b","),
+				StreamFormat::JSONL => self.s.write(b","),
 				#[cfg(feature = "cbor")]
 				StreamFormat::CBOR => Ok::<(), io::Error>(()),
 			}?;
@@ -253,7 +253,7 @@ mod tests {
 		fn serialize_an_empty_string() {
 			let mut buf = vec![];
 
-			let s = StreamingSerializer::new(&mut buf, StreamFormat::JSON);
+			let s = StreamingSerializer::new(&mut buf, StreamFormat::JSONL);
 			s.string("").unwrap();
 			drop(s);
 
@@ -264,7 +264,7 @@ mod tests {
 		fn serialize_a_string() {
 			let mut buf = vec![];
 
-			let s = StreamingSerializer::new(&mut buf, StreamFormat::JSON);
+			let s = StreamingSerializer::new(&mut buf, StreamFormat::JSONL);
 			s.string("ohai!").unwrap();
 			drop(s);
 
@@ -275,7 +275,7 @@ mod tests {
 		fn serialize_bytes() {
 			let mut buf = vec![];
 
-			let s = StreamingSerializer::new(&mut buf, StreamFormat::JSON);
+			let s = StreamingSerializer::new(&mut buf, StreamFormat::JSONL);
 			s.bytes(b"ohai!").unwrap();
 			drop(s);
 
@@ -286,7 +286,7 @@ mod tests {
 		fn serialize_a_uint() {
 			let mut buf = vec![];
 
-			let s = StreamingSerializer::new(&mut buf, StreamFormat::JSON);
+			let s = StreamingSerializer::new(&mut buf, StreamFormat::JSONL);
 			s.uint(420).unwrap();
 			drop(s);
 
@@ -297,7 +297,7 @@ mod tests {
 		fn serialize_an_empty_seq() {
 			let mut buf = vec![];
 
-			let s = StreamingSerializer::new(&mut buf, StreamFormat::JSON);
+			let s = StreamingSerializer::new(&mut buf, StreamFormat::JSONL);
 			let seq = s.seq().unwrap();
 			seq.end().unwrap();
 			drop(seq);
@@ -310,7 +310,7 @@ mod tests {
 		fn serialize_a_seq_with_a_string() {
 			let mut buf = vec![];
 
-			let s = StreamingSerializer::new(&mut buf, StreamFormat::JSON);
+			let s = StreamingSerializer::new(&mut buf, StreamFormat::JSONL);
 			let mut seq = s.seq().unwrap();
 			seq.string("ohai!").unwrap();
 			seq.end().unwrap();
@@ -324,7 +324,7 @@ mod tests {
 		fn serialize_a_seq_with_bytes() {
 			let mut buf = vec![];
 
-			let s = StreamingSerializer::new(&mut buf, StreamFormat::JSON);
+			let s = StreamingSerializer::new(&mut buf, StreamFormat::JSONL);
 			let mut seq = s.seq().unwrap();
 			seq.bytes(b"ohai!").unwrap();
 			seq.end().unwrap();
@@ -338,7 +338,7 @@ mod tests {
 		fn serialize_a_seq_with_a_uint() {
 			let mut buf = vec![];
 
-			let s = StreamingSerializer::new(&mut buf, StreamFormat::JSON);
+			let s = StreamingSerializer::new(&mut buf, StreamFormat::JSONL);
 			let mut seq = s.seq().unwrap();
 			seq.uint(420).unwrap();
 			seq.end().unwrap();
@@ -352,7 +352,7 @@ mod tests {
 		fn serialize_a_seq_with_a_bunch_of_stuff() {
 			let mut buf = vec![];
 
-			let s = StreamingSerializer::new(&mut buf, StreamFormat::JSON);
+			let s = StreamingSerializer::new(&mut buf, StreamFormat::JSONL);
 			let mut seq = s.seq().unwrap();
 			seq.string("ohai!").unwrap();
 			seq.bytes(b"ohai!").unwrap();
@@ -379,7 +379,7 @@ mod tests {
 		fn serialize_an_empty_map() {
 			let mut buf = vec![];
 
-			let s = StreamingSerializer::new(&mut buf, StreamFormat::JSON);
+			let s = StreamingSerializer::new(&mut buf, StreamFormat::JSONL);
 			let map = s.map().unwrap();
 			map.end().unwrap();
 			drop(map);
@@ -392,7 +392,7 @@ mod tests {
 		fn serialize_a_map_with_a_string() {
 			let mut buf = vec![];
 
-			let s = StreamingSerializer::new(&mut buf, StreamFormat::JSON);
+			let s = StreamingSerializer::new(&mut buf, StreamFormat::JSONL);
 			let mut map = s.map().unwrap();
 			map.key("string").unwrap();
 			map.string("ohai!").unwrap();
@@ -407,7 +407,7 @@ mod tests {
 		fn serialize_a_map_with_bytes() {
 			let mut buf = vec![];
 
-			let s = StreamingSerializer::new(&mut buf, StreamFormat::JSON);
+			let s = StreamingSerializer::new(&mut buf, StreamFormat::JSONL);
 			let mut map = s.map().unwrap();
 			map.key("bytes").unwrap();
 			map.bytes(b"ohai!").unwrap();
@@ -422,7 +422,7 @@ mod tests {
 		fn serialize_a_map_with_a_uint() {
 			let mut buf = vec![];
 
-			let s = StreamingSerializer::new(&mut buf, StreamFormat::JSON);
+			let s = StreamingSerializer::new(&mut buf, StreamFormat::JSONL);
 			let mut map = s.map().unwrap();
 			map.key("uint").unwrap();
 			map.uint(420).unwrap();
@@ -437,7 +437,7 @@ mod tests {
 		fn serialize_a_map_with_a_bunch_of_stuff() {
 			let mut buf = vec![];
 
-			let s = StreamingSerializer::new(&mut buf, StreamFormat::JSON);
+			let s = StreamingSerializer::new(&mut buf, StreamFormat::JSONL);
 			let mut map = s.map().unwrap();
 			map.key("string").unwrap();
 			map.string("ohai!").unwrap();

@@ -21,12 +21,16 @@ struct Config {
 	log_url: Url,
 
 	/// The format of the output produced from the scrape
-	#[arg(short, long, default_value_t, value_parser = |s: &str| OutputFormat::try_from(s))]
+	#[arg(short, long, default_value = "jsonl", value_parser = |s: &str| OutputFormat::try_from(s))]
 	format: OutputFormat,
 
 	/// Write the scraped data to the specified file
 	#[arg(short, long)]
 	output: Option<PathBuf>,
+
+	/// Split output files into chunks of this many entries. Only works with --output.
+	#[arg(long, value_parser = value_parser!(u64).range(1..), requires="output")]
+	split_by: Option<u64>,
 
 	/// Include the submitted chain in the output
 	#[arg(long, default_value = "false")]
@@ -54,6 +58,11 @@ const LOG_VERBOSITY_CONFIG: &[&str] = &["warn", "info", "debug", "trace, rustls=
 fn main() {
 	let cfg = Config::parse();
 
+	if cfg.split_by.is_some() && cfg.format != OutputFormat::JSONL {
+		log::error!("File splitting is only supported for jsonl format");
+		exit(1);
+	}
+
 	#[allow(clippy::indexing_slicing, clippy::unwrap_used)]
 	// If this craps out, we have many problems
 	flexi_logger::Logger::try_with_env_or_str(LOG_VERBOSITY_CONFIG[cfg.verbose as usize])
@@ -62,32 +71,21 @@ fn main() {
 		.start()
 		.unwrap();
 
-	let writer: Box<dyn std::io::Write + Send + Sync> = if let Some(output_file) = &cfg.output {
-		match std::fs::File::create(output_file) {
-			Ok(writer) => Box::new(writer),
-			Err(e) => {
-				log::error!(
-					"Could not open output file {}: {}",
-					output_file.display(),
-					e
-				);
-				exit(1);
-			}
-		}
-	} else {
-		Box::new(std::io::stdout())
-	};
+	let args = file_writer::Args::new(
+		cfg.output,
+		fix_url(cfg.log_url.clone()),
+		cfg.split_by,
+	)
+	.include_precert_data(cfg.include_precert_data)
+	.include_chains(cfg.include_chains)
+	.format(cfg.format);
 
-	let args = file_writer::Args::new(writer, fix_url(cfg.log_url.clone()))
-		.include_precert_data(cfg.include_precert_data)
-		.include_chains(cfg.include_chains)
-		.format(cfg.format);
 	let run_config = runner::Config::new(fix_url(cfg.log_url))
 		.user_agent("scrape-ct-log/0.0.0")
 		.limit(cfg.count)
 		.offset(cfg.start);
 
-	if let Err(e) = runner::run::<FileWriter<'_, _>>(&run_config, args) {
+	if let Err(e) = runner::run::<FileWriter<'_>>(&run_config, args) {
 		log::error!("Scrape failed: {e}");
 		exit(1);
 	}
@@ -102,6 +100,7 @@ use ct_structs as _;
 use gen_server as _;
 use num as _;
 use rand as _;
+use serde as _;
 use serde_json as _;
 use thiserror as _;
 use ureq as _;

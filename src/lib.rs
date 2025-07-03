@@ -1,5 +1,4 @@
 //! Fast, efficient scraping for Certificate Transparency logs
-//!
 
 pub mod file_writer;
 pub mod processor;
@@ -17,6 +16,8 @@ pub use utils::fix_url;
 mod binary_deps {
 	use clap as _;
 	use flexi_logger as _;
+	use serde as _;
+	use serde_json as _;
 }
 
 // These deps only exist because their maintainers are unhinged
@@ -43,7 +44,6 @@ mod dev_deps {
 	use lazy_static as _;
 	use predicates as _;
 	use regex as _;
-	use serde as _;
 	use temp_dir as _;
 	use x509_parser as _;
 }
