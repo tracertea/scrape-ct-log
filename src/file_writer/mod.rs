@@ -8,6 +8,7 @@ use serde::Serialize;
 use gen_server::{GenServer, Status::Continue};
 use url::Url;
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::marker::PhantomData;
@@ -126,9 +127,7 @@ enum State<'a> {
 		metadata_path: Option<PathBuf>,
 		output_path: Option<PathBuf>,
 		split_by: Option<u64>,
-		writer: Option<BufWriter<Box<dyn Write + Send + Sync + 'a>>>,
-		entries_in_chunk: u64,
-		current_chunk_start_index: u64,
+		writers: HashMap<u64, BufWriter<Box<dyn Write + Send + Sync + 'a>>>,
 		include_chains: bool,
 		include_precert_data: bool,
 	},
@@ -162,7 +161,8 @@ impl<'a> GenServer for FileWriter<'a> {
 	fn init(args: Args) -> Result<Self, Self::Error> {
 		let state = match args.format {
 			OutputFormat::JSONL => {
-				let writer: Option<BufWriter<Box<dyn Write + Send + Sync + 'a>>>;
+				let mut writers: HashMap<u64, BufWriter<Box<dyn Write + Send + Sync + 'a>>> =
+					HashMap::new();
 				let metadata_path: Option<PathBuf>;
 				let output_path: Option<PathBuf>;
 
@@ -172,21 +172,19 @@ impl<'a> GenServer for FileWriter<'a> {
 					metadata_path = Some(PathBuf::from(mp));
 					output_path = Some(p.clone());
 
-					if args.split_by.is_some() {
-						writer = None;
-					} else {
+					if args.split_by.is_none() {
 						let file: Box<dyn Write + Send + Sync + 'a> = Box::new(
 							File::create(&p)
 								.map_err(|e| Error::system("failed to create output file", e))?,
 						);
-						writer = Some(BufWriter::new(file));
+						writers.insert(0, BufWriter::new(file));
 					}
 				} else {
 					let stdout: Box<dyn Write + Send + Sync + 'a> = Box::new(io::stdout());
-					writer = Some(BufWriter::new(stdout));
+					writers.insert(0, BufWriter::new(stdout));
 					metadata_path = None;
 					output_path = None;
-				};
+				}
 
 				State::Jsonl {
 					log_url: args.log_url,
@@ -195,9 +193,7 @@ impl<'a> GenServer for FileWriter<'a> {
 					metadata_path,
 					output_path,
 					split_by: args.split_by,
-					writer,
-					entries_in_chunk: 0,
-					current_chunk_start_index: 0,
+					writers,
 					include_chains: args.include_chains,
 					include_precert_data: args.include_precert_data,
 				}
@@ -248,9 +244,7 @@ impl<'a> GenServer for FileWriter<'a> {
 				sth,
 				output_path,
 				split_by,
-				writer,
-				entries_in_chunk,
-				current_chunk_start_index,
+				writers,
 				include_chains,
 				include_precert_data,
 				..
@@ -260,52 +254,67 @@ impl<'a> GenServer for FileWriter<'a> {
 					Ok(Continue)
 				}
 				processor::Request::Entry(id, entry) => {
-					if let Some(split_size) = split_by {
-						if writer.is_none() || *entries_in_chunk >= *split_size {
-							if let Some(w) = writer.take() {
-								w.into_inner()
-									.map_err(|e| Error::system("flushing file writer", e))?
-									.flush()
-									.map_err(|e| Error::system("flushing file", e))?;
-							}
+					let chunk_key = if let Some(split_size) = split_by {
+						(id / *split_size) * *split_size
+					} else {
+						0
+					};
 
-							let p = output_path.as_ref().ok_or_else(|| {
-								Error::internal("split_by is set but output_path is not")
-							})?;
+					if !writers.contains_key(&chunk_key) {
+						let p = output_path.as_ref().ok_or_else(|| {
+							Error::internal("split_by is set but output_path is not")
+						})?;
 
-							let stem = p
-								.file_stem()
-								.and_then(std::ffi::OsStr::to_str)
-								.unwrap_or_default();
-							let ext = p
-								.extension()
-								.and_then(std::ffi::OsStr::to_str)
-								.unwrap_or("jsonl");
+						let stem = p
+							.file_stem()
+							.and_then(std::ffi::OsStr::to_str)
+							.unwrap_or_default();
+						let ext = p
+							.extension()
+							.and_then(std::ffi::OsStr::to_str)
+							.unwrap_or("jsonl");
 
-							let new_filename = format!("{stem}.{id}.{ext}");
-							let new_path = p.with_file_name(new_filename);
+						let new_filename = format!("{stem}.{chunk_key}.{ext}");
+						let new_path = p.with_file_name(new_filename);
 
-							let file: Box<dyn Write + Send + Sync> = Box::new(
-								File::create(&new_path)
-									.map_err(|e| Error::system("failed to create chunk file", e))?,
-							);
-							*writer = Some(BufWriter::new(file));
-							*entries_in_chunk = 0;
-							*current_chunk_start_index = id;
-						}
+						let file: Box<dyn Write + Send + Sync> = Box::new(
+							File::create(new_path)
+								.map_err(|e| Error::system("failed to create chunk file", e))?,
+						);
+
+						writers.insert(chunk_key, BufWriter::new(file));
 					}
 
-					let current_writer = writer.as_mut().ok_or_else(|| {
-						Error::internal("writer is not available for entry")
-					})?;
+					let current_writer = writers
+						.get_mut(&chunk_key)
+						.ok_or_else(|| Error::internal("writer is not available for entry chunk"))?;
 
 					let (timestamp, certificate, chain_certs, precert) =
 						if let TreeLeafEntry::TimestampedEntry(ts_entry) = &entry.leaf_input.entry {
 							match (&ts_entry.signed_entry, &entry.extra_data) {
-							 (SignedEntry::X509Entry(x509_entry), ExtraData::X509ExtraData(extra_data)) => Ok((ts_entry.timestamp, &x509_entry.certificate, &extra_data.certificate_chain, None)),
-							 (SignedEntry::PrecertEntry(precert_entry), ExtraData::PrecertExtraData(extra_data)) => Ok((ts_entry.timestamp, &extra_data.pre_certificate.certificate, &extra_data.precertificate_chain, Some(precert_entry))),
-							 _ => Err(Error::InternalError(format!("incompatible combination of signed_entry and extra_data ({:?} vs {:?})", ts_entry.signed_entry, entry.extra_data))),
-						 }
+								(
+									SignedEntry::X509Entry(x509_entry),
+									ExtraData::X509ExtraData(extra_data),
+								) => Ok((
+									ts_entry.timestamp,
+									&x509_entry.certificate,
+									&extra_data.certificate_chain,
+									None,
+								)),
+								(
+									SignedEntry::PrecertEntry(precert_entry),
+									ExtraData::PrecertExtraData(extra_data),
+								) => Ok((
+									ts_entry.timestamp,
+									&extra_data.pre_certificate.certificate,
+									&extra_data.precertificate_chain,
+									Some(precert_entry),
+								)),
+								_ => Err(Error::InternalError(format!(
+									"incompatible combination of signed_entry and extra_data ({:?} vs {:?})",
+									ts_entry.signed_entry, entry.extra_data
+								))),
+							}
 						} else {
 							Err(Error::EntryDecodingError(
 								"leaf_input was not a TimestampedEntry".to_string(),
@@ -345,7 +354,6 @@ impl<'a> GenServer for FileWriter<'a> {
 					current_writer
 						.write_all(b"\n")
 						.map_err(|e| Error::output("jsonl newline", e))?;
-					*entries_in_chunk += 1;
 
 					Ok(Continue)
 				}
@@ -405,10 +413,29 @@ impl<'a> GenServer for FileWriter<'a> {
 								&entry.leaf_input.entry
 							{
 								match (&ts_entry.signed_entry, &entry.extra_data) {
-							 (SignedEntry::X509Entry(x509_entry), ExtraData::X509ExtraData(extra_data)) => Ok((ts_entry.timestamp, &x509_entry.certificate, &extra_data.certificate_chain, None)),
-							 (SignedEntry::PrecertEntry(precert_entry), ExtraData::PrecertExtraData(extra_data)) => Ok((ts_entry.timestamp, &extra_data.pre_certificate.certificate, &extra_data.precertificate_chain, Some(precert_entry.clone()))),
-							 _ => Err(Error::InternalError(format!("incompatible combination of signed_entry and extra_data ({:?} vs {:?})", ts_entry.signed_entry, entry.extra_data))),
-						 }
+									(
+										SignedEntry::X509Entry(x509_entry),
+										ExtraData::X509ExtraData(extra_data),
+									) => Ok((
+										ts_entry.timestamp,
+										&x509_entry.certificate,
+										&extra_data.certificate_chain,
+										None,
+									)),
+									(
+										SignedEntry::PrecertEntry(precert_entry),
+										ExtraData::PrecertExtraData(extra_data),
+									) => Ok((
+										ts_entry.timestamp,
+										&extra_data.pre_certificate.certificate,
+										&extra_data.precertificate_chain,
+										Some(precert_entry.clone()),
+									)),
+									_ => Err(Error::InternalError(format!(
+										"incompatible combination of signed_entry and extra_data ({:?} vs {:?})",
+										ts_entry.signed_entry, entry.extra_data
+									))),
+								}
 							} else {
 								Err(Error::EntryDecodingError(
 									"leaf_input was not a TimestampedEntry".to_string(),
@@ -496,14 +523,11 @@ impl<'a> GenServer for FileWriter<'a> {
 				sth,
 				scrape_begin_timestamp,
 				metadata_path,
-				writer,
+				writers,
 				..
 			} => {
-				if let Some(w) = writer.take() {
-					drop(
-						w.into_inner()
-							.map_err(|e| Error::system("flushing file writer on terminate", e)),
-					);
+				for (_, mut writer) in writers.drain() {
+					drop(writer.flush());
 				}
 
 				if let (Some(path), Some(sth_val)) = (metadata_path, sth.as_ref()) {
@@ -516,7 +540,9 @@ impl<'a> GenServer for FileWriter<'a> {
 
 					if let Ok(file) = File::create(path) {
 						let mut writer = BufWriter::new(file);
-						drop(serde_json::to_writer_pretty(&mut writer, &metadata));
+						if let Ok(()) = serde_json::to_writer_pretty(&mut writer, &metadata) {
+							drop(writer.write_all(b"\n"));
+						}
 						drop(writer.flush());
 					}
 				}
